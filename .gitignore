@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+.venv311/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+
+# PyCharm / IDE settings
+.idea/
+
+# Logs and temporary files
+*.log
+server.log
+logs/
+.pytest_cache/
+
+# Isabelle / generated temporary files
+*.thy~
+
+tmp/

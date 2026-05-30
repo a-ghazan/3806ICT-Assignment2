@@ -1,0 +1,9 @@
+isabelle-client
+scikit-learn
+xgboost
+joblib
+requests
+tabulate
+fastapi 
+uvicorn
+torch
