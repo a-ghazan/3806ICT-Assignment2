@@ -180,6 +180,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if args.trace and ("--verbose" in (argv or sys.argv) or "--repair-trace" in (argv or sys.argv)):
         print("[planner] Note: --verbose/--repair-trace are deprecated; use --trace.", flush=True)
+    print()
     print(res.outline, end="" if res.outline.endswith("\n") else "\n")
     return 0 if res.success else 1
 
