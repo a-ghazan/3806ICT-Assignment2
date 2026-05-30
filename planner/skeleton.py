@@ -4,6 +4,13 @@
 #           skeletons generated locally --> llm also generates proof outline skeletons --> all
 #           candidates are sanitised --> structurally dangerous candidates rejected --> check
 #           candidates in isabelle --> choose safest, most fillable outline
+#
+# Improvement rationale:
+# The original LLM-only skeleton generation often produced plausible-looking
+# but unsafe Isar outlines, such as circular have-statements, invalid case
+# structures, or mixed apply/Isar proof styles. This file now combines local
+# theorem-shape-aware templates with LLM candidates and applies structural
+# safety penalties before selecting an outline.
 # ----------------------------------------------------------------------------------------- #
 
 from __future__ import annotations
