@@ -808,23 +808,28 @@ def _safe_templates_for_goal(goal: str) -> List[Skeleton]:
     templates: List[Skeleton] = []
 
     # Iff / equivalence: prove both directions.
+    # Avoid this generic iff template for list-recursion goals such as:
+    #   (∀x∈set xs. P x) ⟷ filter P xs = xs
+    # These usually need induction rather than a plain two-direction proof.
     split = _split_top_level_once(g, "⟷")
-    if split:
+    list_recursion_goal = any(tok in g for tok in ["filter", "map", "rev", "@", "length"])
+
+    if split and not list_recursion_goal:
         left, right = map(_strip_outer_parens, split)
         templates.append(_mk_skeleton(
-f'''lemma "{g}"
-proof
-  assume H: "{left}"
-  show "{right}"
-    using H
-    sorry
-next
-  assume H: "{right}"
-  show "{left}"
-    using H
-    sorry
-qed
-'''))
+            f'''lemma "{g}"
+    proof
+      assume H: "{left}"
+      show "{right}"
+        using H
+        sorry
+    next
+      assume H: "{right}"
+      show "{left}"
+        using H
+        sorry
+    qed
+    '''))
 
     # Object-level implication: assume premise, show conclusion.
     split = _split_top_level_once(g, "⟶")
@@ -856,21 +861,32 @@ qed
             lines.append("qed")
             templates.append(_mk_skeleton("\n".join(lines)))
 
-    # Set equality: prove mutual inclusion, but avoid card/image equalities.
+    # Set equality: prove mutual inclusion, but only when the WHOLE goal is a set equality.
+    # Do not trigger this inside iff/implication goals such as:
+    #   (∀x∈set xs. P x) ⟷ filter P xs = xs
+    # because the "=" belongs to one side of the iff, not to the whole theorem shape.
     eq_split = _split_top_level_once(g, "=")
-    if eq_split and "card" not in g:
+    has_outer_iff = _split_top_level_once(g, "⟷") is not None
+    has_outer_obj_imp = _split_top_level_once(g, "⟶") is not None
+
+    if eq_split and not has_outer_iff and not has_outer_obj_imp and "card" not in g:
         left, right = map(_strip_outer_parens, eq_split)
-        if _looks_like_set_expr(left) or _looks_like_set_expr(right):
+
+        # Be conservative: require genuine set operators, not just "set xs" inside
+        # a quantifier or list theorem.
+        set_equality_cues = ["∩", "∪", "⊆", "⊂", "Pow", "`"]
+
+        if any(tok in left or tok in right for tok in set_equality_cues):
             templates.append(_mk_skeleton(
-f'''lemma "{g}"
-proof
-  show "{left} ⊆ {right}"
-    sorry
-next
-  show "{right} ⊆ {left}"
-    sorry
-qed
-'''))
+                f'''lemma "{g}"
+    proof
+      show "{left} ⊆ {right}"
+        sorry
+    next
+      show "{right} ⊆ {left}"
+        sorry
+    qed
+    '''))
 
     # Common list-recursion goals: use induction rather than invented have-chains.
     ind_var = _choose_list_induction_var(g)
@@ -1164,6 +1180,7 @@ def propose_isar_skeleton_diverse_best(
         direct_templates = _direct_templates_for_goal(goal)
 
         if trace:
+            print()
             print(f"[skeleton] Stage 1: trying {len(direct_templates)} verified direct template(s)")
 
         for i, sk in enumerate(direct_templates, start=1):
@@ -1183,7 +1200,8 @@ def propose_isar_skeleton_diverse_best(
                     "selected_text": sk.text,
                 }
                 return sk, diag
-
+    if trace:
+        print()
     # Candidate sources are tracked for debugging/analysis.
     # This makes it clear whether the selected outline came from:
     # - a local safe theorem-shape template,
@@ -1224,6 +1242,7 @@ def propose_isar_skeleton_diverse_best(
             cand_sources.append(source)
 
     if trace:
+        print()
         print(f"[skeleton] Unique candidates after de-duplication: {len(cands)}")
         for i, (source, sk) in enumerate(zip(cand_sources, cands), start=1):
             preview = " ".join(sk.text.strip().splitlines()[:2])
@@ -1243,21 +1262,26 @@ def propose_isar_skeleton_diverse_best(
         safe_pen = _safety_penalty(goal, sk.text)
         hint_b = _hint_bonus_from_outline(sk.text, rec_hints)
 
+        n_for_score = n
+        if n == 9999 and cand_sources[i] == "safe_template":
+            n_for_score = 20
+
         score = (
-            alpha * float(n)
-            + beta * float(pat_pen)
-            + 1.0 * float(safe_pen)
-            - gamma * float(hint_b)
+                alpha * float(n_for_score)
+                + beta * float(pat_pen)
+                + 1.0 * float(safe_pen)
+                - gamma * float(hint_b)
         )
 
         scored.append((score, n, i))
 
         if trace:
+            print()
             print(
                 f"[skeleton] score candidate {i + 1}: "
                 f"source={cand_sources[i]}, "
                 f"score={score:.3f}, "
-                f"subgoals={n}, "
+                f"subgoals={n}, score_subgoals={n_for_score}, "
                 f"pattern_penalty={pat_pen:.3f}, "
                 f"safety_penalty={safe_pen:.3f}, "
                 f"hint_bonus={hint_b}, "
