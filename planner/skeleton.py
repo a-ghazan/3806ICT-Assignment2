@@ -1,16 +1,11 @@
 # ----------------------------------------------------------------------------------------- #
 # skeleton.py
-# Workflow: A goal is input --> a rough theorem shape is detected --> safe proof outline
-#           skeletons generated locally --> llm also generates proof outline skeletons --> all
-#           candidates are sanitised --> structurally dangerous candidates rejected --> check
-#           candidates in isabelle --> choose safest, most fillable outline
-#
-# Improvement rationale:
-# The original LLM-only skeleton generation often produced plausible-looking
-# but unsafe Isar outlines, such as circular have-statements, invalid case
-# structures, or mixed apply/Isar proof styles. This file now combines local
-# theorem-shape-aware templates with LLM candidates and applies structural
-# safety penalties before selecting an outline.
+# Workflow:
+# Stage 1 - try small verified direct Isar proofs
+# Stage 2 - if direct proof fails, use safe theorem-shape-aware outlines
+# Stage 3 - LLM candidates are forced into outline form
+# Stage 4 - safety scoring chooses among outlines
+# Stage 5 - Fill/Prove handles remaining holes
 # ----------------------------------------------------------------------------------------- #
 
 from __future__ import annotations
@@ -324,6 +319,57 @@ def _crop_to_first_proof_block(text: str) -> str:
         return tail
 
     return tail[:end_idx] + "\n"
+
+def _drop_redundant_sorry(text: str) -> str:
+    """Remove a `sorry` that directly follows a finisher.
+
+    Models frequently emit BOTH a real finisher and a trailing `sorry` for the
+    same obligation, e.g.
+
+        have f1: "..."
+          using a1 by simp
+          sorry            <-- illegal: the `have` is already closed by `by simp`
+
+    The skeleton prompt's examples only ever model `sorry` at every leaf, which
+    nudges the model toward appending `sorry` even when it also supplied a `by`.
+    `_ensure_have_show_bodies` only *adds* missing bodies; it never removes this
+    redundant `sorry`, so the malformed pair survives and aborts the proof before
+    the fill/repair stages can run. This pass deletes the dangling `sorry` when the
+    nearest preceding non-blank line already closed the goal.
+
+    A line "closes the goal" if it is `done`, a bare `.`/`..`, a standalone
+    `by <method>`, or ends in an inline ` by <method>` (e.g. `using a1 by simp`).
+    We intentionally do NOT treat `proof`/`next`/`qed`/`case` as closers, so we
+    never strip a `sorry` that is the legitimate body of a freshly opened goal.
+
+    Additionally collapses *duplicate* sorries: a standalone `sorry` whose nearest
+    preceding non-blank line already ends the obligation with `sorry` (either a
+    standalone `sorry` or an inline `... sorry`, e.g. `have f4: "..." sorry`). The
+    model sometimes emits both an inline and a trailing sorry for one `have`, which
+    is malformed; we keep the first and drop the redundant follow-on.
+    """
+    lines = text.splitlines()
+    out: List[str] = []
+    # Index, in `out`, of the most recent non-blank line (for back-reference).
+    last_nonblank = -1
+    closer_by = re.compile(r"(?m)^\s*by\b")
+    closer_done = re.compile(r"(?m)^\s*(?:done|\.\.?)\s*$")
+    inline_by = re.compile(r"\s+by\s+\S")
+    ends_in_sorry = re.compile(r"\bsorry\s*$")
+    for L in lines:
+        if SORRY_RE.search(L) and L.strip() == "sorry" and last_nonblank >= 0:
+            prev = out[last_nonblank]
+            # (a) redundant after a real finisher
+            if closer_by.match(prev) or closer_done.match(prev) or inline_by.search(prev):
+                continue
+            # (b) duplicate sorry: the obligation is already terminated by a sorry
+            #     on the previous non-blank line (standalone or inline).
+            if ends_in_sorry.search(prev):
+                continue
+        out.append(L)
+        if L.strip() != "":
+            last_nonblank = len(out) - 1
+    return "\n".join(out)
 
 def _normalize_show_kinds(text: str) -> str:
     """
@@ -751,7 +797,6 @@ def _choose_list_induction_var(goal: str) -> Optional[str]:
 
     return None
 
-
 def _safe_templates_for_goal(goal: str) -> List[Skeleton]:
     """
     Generate conservative theorem-shape-aware Isar skeletons.
@@ -761,22 +806,6 @@ def _safe_templates_for_goal(goal: str) -> List[Skeleton]:
     """
     g = goal.strip()
     templates: List[Skeleton] = []
-
-    # Always include minimal Isar wrappers. These keep simple goals simple while
-    # still producing Isar-style proof blocks.
-    templates.append(_mk_skeleton(
-f'''lemma "{g}"
-proof -
-  show ?thesis by simp
-qed
-'''))
-
-    templates.append(_mk_skeleton(
-f'''lemma "{g}"
-proof -
-  show ?thesis by auto
-qed
-'''))
 
     # Iff / equivalence: prove both directions.
     split = _split_top_level_once(g, "⟷")
@@ -871,6 +900,72 @@ qed
 '''))
 
     return templates
+
+def _direct_templates_for_goal(goal: str) -> List[Skeleton]:
+    """
+    Small complete Isar proofs generated locally.
+
+    These are not scored using sketch heuristics. They are tried first and only
+    accepted if Isabelle fully verifies them.
+    """
+    g = goal.strip()
+
+    templates: List[Skeleton] = []
+
+    # General-purpose direct methods.
+    methods = ["auto", "blast", "fastforce", "force", "simp"]
+
+    for method in methods:
+        templates.append(_mk_skeleton(
+f'''lemma "{g}"
+proof -
+  show ?thesis by {method}
+qed
+'''
+        ))
+
+    # Library-fact-aware direct template for injective image cardinality.
+    # Plain simp/auto is too weak here, but Isabelle can solve this theorem
+    # once the assumptions are introduced and card_image is available.
+    if "card" in g and "`" in g and "inj_on" in g and "⟹" in g:
+        parts = [p.strip() for p in g.split("⟹") if p.strip()]
+
+        if len(parts) >= 2:
+            assumptions = parts[:-1]
+            conclusion = parts[-1]
+
+            lines = [f'lemma "{g}"', "proof -"]
+
+            for i, asm in enumerate(assumptions, start=1):
+                lines.append(f'  assume H{i}: "{asm}"')
+
+            using = " ".join(f"H{i}" for i in range(1, len(assumptions) + 1))
+
+            lines.append(f'  show "{conclusion}"')
+            lines.append(f'    using {using}')
+            lines.append("    by (simp add: card_image)")
+            lines.append("qed")
+
+            templates.append(_mk_skeleton("\n".join(lines)))
+
+    return templates
+
+def _verifies_complete_proof(isabelle, session_id: str, proof_text: str) -> bool:
+    """
+    Fully verify a complete no-sorry proof candidate.
+
+    This is used only for small direct templates, so it avoids the earlier
+    slowdown caused by verifying every long LLM-generated proof.
+    """
+    if "sorry" in proof_text:
+        return False
+
+    try:
+        thy = build_theory(proof_text.splitlines(), add_print_state=False, end_with=None)
+        ok, _ = finished_ok(run_theory(isabelle, session_id, thy))
+        return bool(ok)
+    except Exception:
+        return False
 
 def _full_verification_penalty(isabelle, session_id: str, outline_text: str) -> float:
     """
@@ -1041,6 +1136,7 @@ def propose_isar_skeleton_diverse_best(
     # NEW: hint lexicon
     hintlex_path: Optional[str] = None,
     hintlex_top: int = 8,
+    trace: bool = False,
 ) -> Tuple[Skeleton, Dict[str, Any]]:
     """
     Generate K outlines, optionally inject context & hintlex hints, run one-shot sketch checks,
@@ -1057,58 +1153,130 @@ def propose_isar_skeleton_diverse_best(
         rec_hints += _hints_from_hintlex(goal, hintlex, top=hintlex_top)
     rec_hints = list(dict.fromkeys(rec_hints))[:12]  # stable de-dup + cap
 
-    # IMPROVEMENT - Outline candidates:
-    # 1. safe theorem-shape-aware templates generated locally,
-    # 2. optional older library templates,
-    # 3. LLM-generated candidates.
-    #
-    # This keeps the LLM in the loop, but prevents free-form LLM outlines from
-    # being the only available proof shapes.
+    # -------------------------------------------------------------------------
+    # Stage 1: verified direct Isar proofs
+    # -------------------------------------------------------------------------
+    # Try small locally generated proofs first. These are cheap and safe because
+    # we accept them only if Isabelle fully verifies them. This prevents the
+    # selector from choosing a long unverified LLM proof when a simple method
+    # like auto/blast/simp already works.
+    if not force_outline:
+        direct_templates = _direct_templates_for_goal(goal)
+
+        if trace:
+            print(f"[skeleton] Stage 1: trying {len(direct_templates)} verified direct template(s)")
+
+        for i, sk in enumerate(direct_templates, start=1):
+            ok = _verifies_complete_proof(isabelle, session_id, sk.text)
+
+            if trace:
+                first_proof_line = next(
+                    (ln.strip() for ln in sk.text.splitlines() if ln.strip().startswith("by ") or " by " in ln),
+                    "(multi-line proof)"
+                )
+                print(f"[skeleton] direct candidate {i}: {first_proof_line} -> {'PASS' if ok else 'FAIL'}")
+
+            if ok:
+                diag = {
+                    "selected_source": "verified_direct",
+                    "direct_candidates": len(direct_templates),
+                    "selected_text": sk.text,
+                }
+                return sk, diag
+
+    # Candidate sources are tracked for debugging/analysis.
+    # This makes it clear whether the selected outline came from:
+    # - a local safe theorem-shape template,
+    # - the older optional library templates,
+    # - or the LLM.
     safe_templates = _safe_templates_for_goal(goal)
 
-    cands = safe_templates + propose_isar_skeletons(
+    llm_candidates = propose_isar_skeletons(
         goal, model=model, temps=temps, k=k,
-        force_outline=force_outline, hints=rec_hints
+        force_outline=True, hints=rec_hints
     )
 
+    raw_pairs: List[Tuple[str, Skeleton]] = []
+
     if lib_templates:
-        cands = _lib_templates_for_goal(goal) + cands
+        raw_pairs.extend(("lib_template", sk) for sk in _lib_templates_for_goal(goal))
+
+    raw_pairs.extend(("safe_template", sk) for sk in safe_templates)
+    raw_pairs.extend(("llm", sk) for sk in llm_candidates)
+
+    if trace:
+        print("[skeleton] Candidate source counts:")
+        print(f"  safe templates: {len(safe_templates)}")
+        print(f"  llm candidates: {len(llm_candidates)}")
+        print(f"  lib templates:  {len(_lib_templates_for_goal(goal)) if lib_templates else 0}")
 
     # Stable de-duplication after all candidate sources are combined.
+    # If two sources produce identical text, keep the earlier source.
     seen_texts = set()
-    deduped: List[Skeleton] = []
-    for sk in cands:
+    cands: List[Skeleton] = []
+    cand_sources: List[str] = []
+
+    for source, sk in raw_pairs:
         key = sk.text.strip()
         if key and key not in seen_texts:
             seen_texts.add(key)
-            deduped.append(sk)
-    cands = deduped
+            cands.append(sk)
+            cand_sources.append(source)
+
+    if trace:
+        print(f"[skeleton] Unique candidates after de-duplication: {len(cands)}")
+        for i, (source, sk) in enumerate(zip(cand_sources, cands), start=1):
+            preview = " ".join(sk.text.strip().splitlines()[:2])
+            print(
+                f"  candidate {i}: source={source}, "
+                f"holes={len(sk.holes)}, chars={len(sk.text)}, preview={preview[:120]}"
+            )
 
     # Load optional priors/rules
     rules = _load_priors(priors_path)
 
     scored: List[Tuple[float, int, int]] = []  # (score, n_subgoals, idx)
+
     for i, sk in enumerate(cands):
         n = _quick_sketch_score(isabelle, session_id, sk.text)
         pat_pen = _pattern_penalty(goal, sk.text, rules)
         safe_pen = _safety_penalty(goal, sk.text)
         hint_b = _hint_bonus_from_outline(sk.text, rec_hints)
 
-        # Composite score:
-        # - subgoal count estimates how much proof work remains
-        # - pattern_penalty captures existing weak priors
-        # - safety_penalty captures known structurally dangerous outlines
-        # - hint bonus rewards use of retrieved hints
         score = (
-                alpha * float(n)
-                + beta * float(pat_pen)
-                + 1.0 * float(safe_pen)
-                - gamma * float(hint_b)
+            alpha * float(n)
+            + beta * float(pat_pen)
+            + 1.0 * float(safe_pen)
+            - gamma * float(hint_b)
         )
+
         scored.append((score, n, i))
 
+        if trace:
+            print(
+                f"[skeleton] score candidate {i + 1}: "
+                f"source={cand_sources[i]}, "
+                f"score={score:.3f}, "
+                f"subgoals={n}, "
+                f"pattern_penalty={pat_pen:.3f}, "
+                f"safety_penalty={safe_pen:.3f}, "
+                f"hint_bonus={hint_b}, "
+                f"holes={len(sk.holes)}"
+            )
+
     scored.sort(key=lambda x: (x[0], x[1], x[2]))
-    best = cands[scored[0][2]]
+    best_idx = scored[0][2]
+    best = cands[best_idx]
+
+    if trace:
+        print(
+            f"[skeleton] selected candidate {best_idx + 1}: "
+            f"source={cand_sources[best_idx]}, "
+            f"score={scored[0][0]:.3f}, "
+            f"subgoals={scored[0][1]}, "
+            f"holes={len(best.holes)}"
+        )
+
     diag = {
         "scores": scored,
         "num_candidates": len(cands),
@@ -1116,6 +1284,7 @@ def propose_isar_skeleton_diverse_best(
         "priors_rules": len(rules),
         "alpha_beta_gamma": (alpha, beta, gamma),
         "safe_templates": len(safe_templates),
-        "uses_full_verification_penalty": True,
+        "selected_source": cand_sources[best_idx],
     }
+
     return best, diag
